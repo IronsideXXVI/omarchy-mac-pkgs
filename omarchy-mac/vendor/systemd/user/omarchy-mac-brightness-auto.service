@@ -1,0 +1,14 @@
+[Unit]
+Description=Follow the room light with the built-in display's brightness
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecCondition=/usr/bin/omarchy-hw-apple-silicon
+ExecStart=/usr/bin/omarchy-mac-brightness-auto
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target

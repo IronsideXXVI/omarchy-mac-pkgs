@@ -1,0 +1,123 @@
+#!/bin/bash
+
+# omarchy:summary=Follow the room light with the built-in display's brightness, as macOS does
+# omarchy:args=[on|off|status]
+# omarchy:examples=omarchy mac brightness-auto status | omarchy mac brightness-auto off | omarchy mac brightness-auto on
+
+# macOS ships automatic brightness on for the built-in display. This reads the ambient light
+# sensor, looks the room's illuminance up in the model's curve (lux to nits, from macOS's own
+# curve, in /usr/share/omarchy-mac/brightness named after the device tree's first compatible)
+# and moves the backlight there over the ramp macOS uses. A brightness the user sets by hand
+# becomes the new level for the room: the curve is scaled by it, as macOS scales its curve.
+# Runs only on a Mac with a table and a light sensor, and steps aside while Omarchy's own
+# omarchy-brightness-auto service runs.
+
+set -u
+
+omarchy-hw-apple-silicon 2>/dev/null || exit 0
+
+table_dir=${OMARCHY_MAC_BRIGHTNESS_DIR:-/usr/share/omarchy-mac/brightness}
+iio_root=${OMARCHY_MAC_IIO_ROOT:-/sys/bus/iio/devices}
+backlight_root=${OMARCHY_MAC_BACKLIGHT_ROOT:-/sys/class/backlight}
+compatible_file=${OMARCHY_MAC_DT_COMPATIBLE:-/proc/device-tree/compatible}
+config_dir=${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-mac
+off_file=$config_dir/brightness-auto-off
+scale_file=$config_dir/brightness-auto-scale
+state_file=${XDG_RUNTIME_DIR:-/tmp}/omarchy-mac-brightness-auto.last
+once=${OMARCHY_MAC_BRIGHTNESS_ONCE:-}
+step_sleep=${OMARCHY_MAC_BRIGHTNESS_STEP_SLEEP:-}
+
+model() { tr '\0' '\n' <"$compatible_file" 2>/dev/null | head -n1; }
+
+load_table() {
+  local file
+  file="$table_dir/$(model).conf"
+  [[ -r $file ]] || return 1
+  # shellcheck disable=SC1090
+  source "$file"
+}
+
+sensor() {
+  local dir
+  for dir in "$iio_root"/iio:device*; do
+    [[ -r $dir/in_illuminance_input ]] && { echo "$dir"; return 0; }
+  done
+  return 1
+}
+
+read_raw() { local v; v=$(<"$backlight_root/$BACKLIGHT/brightness") 2>/dev/null && echo "$v"; }
+read_max() { local v; v=$(<"$backlight_root/$BACKLIGHT/max_brightness") 2>/dev/null && echo "$v"; }
+write_raw() { brightnessctl -q -d "$BACKLIGHT" set "$1" >/dev/null 2>&1 && echo "$1" >"$state_file"; }
+
+# The curve's nits for a room at $1 lux, times the user's scale, within the panel's range.
+target_nits() {
+  awk -v lux="$1" -v curve="$CURVE" -v scale="$2" -v lo="$MIN_NITS" -v hi="$MAX_NITS" 'BEGIN {
+    n = split(curve, p, " ")
+    for (i = 1; i <= n; i++) { split(p[i], q, ":"); x[i] = q[1] + 0; y[i] = q[2] + 0 }
+    if (lux <= x[1]) t = y[1]
+    else if (lux >= x[n]) t = y[n]
+    else for (i = 1; i < n; i++) if (lux >= x[i] && lux <= x[i + 1]) {
+      t = y[i] + (y[i + 1] - y[i]) * (lux - x[i]) / (x[i + 1] - x[i]); break
+    }
+    t *= scale
+    if (t < lo) t = lo
+    if (t > hi) t = hi
+    printf "%.2f\n", t
+  }'
+}
+
+nits_to_raw() { awk -v n="$1" -v m="$2" -v hi="$MAX_NITS" 'BEGIN { r = int(n * m / hi + 0.5); if (r < 1) r = 1; if (r > m) r = m; print r }'; }
+
+status() {
+  local enabled=on
+  [[ -e $off_file ]] && enabled=off
+  echo "Automatic brightness: $enabled, scale $(cat "$scale_file" 2>/dev/null || echo 1)"
+}
+
+case ${1:-run} in
+  status) status; exit 0 ;;
+  off) mkdir -p "$config_dir" && touch "$off_file"; status; exit 0 ;;
+  on) rm -f "$off_file"; status; exit 0 ;;
+  run) ;;
+  *) echo "Usage: omarchy-mac-brightness-auto [on|off|status]" >&2; exit 2 ;;
+esac
+
+load_table || exit 0
+dir=$(sensor) || exit 0
+max=$(read_max) || exit 0
+[[ -n $step_sleep ]] || step_sleep=$(awk -v r="$RAMP_SECONDS" -v s="$RAMP_STEPS" 'BEGIN { printf "%.3f\n", r / s }')
+
+smoothed=""
+while :; do
+  if [[ ! -e $off_file ]] && ! systemctl --user is-active --quiet omarchy-brightness-auto.service 2>/dev/null; then
+    lux=$(<"$dir/in_illuminance_input") 2>/dev/null || lux=""
+    raw=$(read_raw) || raw=""
+    if [[ -n $lux && -n $raw ]] && (( raw > 0 )); then
+      smoothed=$(awk -v o="${smoothed:-$lux}" -v n="$lux" -v w="$SMOOTHING" 'BEGIN { printf "%.4f\n", o * (1 - w) + n * w }')
+      scale=$(cat "$scale_file" 2>/dev/null || echo 1)
+      last=$(cat "$state_file" 2>/dev/null || echo "")
+      # A level we did not write is the user's: it rescales the curve for this room.
+      if [[ -n $last ]] && (( raw > last + 1 || raw < last - 1 )); then
+        base=$(target_nits "$smoothed" 1)
+        scale=$(awk -v r="$raw" -v m="$max" -v hi="$MAX_NITS" -v b="$base" 'BEGIN {
+          s = (r * hi / m) / b; if (s < 0.1) s = 0.1; if (s > 10) s = 10; printf "%.4f\n", s }')
+        mkdir -p "$config_dir" && echo "$scale" >"$scale_file"
+        echo "$raw" >"$state_file"
+      else
+        want=$(nits_to_raw "$(target_nits "$smoothed" "$scale")" "$max")
+        # Small moves are left alone (sensor jitter, the panel's own light in a dark room).
+        if awk -v w="$want" -v r="$raw" -v p="$HYSTERESIS_PERCENT" -v m="$max" -v hi="$MAX_NITS" 'BEGIN {
+             d = w - r; if (d < 0) d = -d; lim = r * p / 100; if (lim < m * 2 / hi) lim = m * 2 / hi; exit !(d > lim) }'; then
+          for (( i = 1; i <= RAMP_STEPS; i++ )); do
+            write_raw "$(awk -v a="$raw" -v b="$want" -v i="$i" -v s="$RAMP_STEPS" 'BEGIN { printf "%d\n", int(a + (b - a) * i / s + 0.5) }')" || break
+            (( i < RAMP_STEPS )) && sleep "$step_sleep"
+          done
+        elif [[ -z $last ]]; then
+          echo "$raw" >"$state_file"
+        fi
+      fi
+    fi
+  fi
+  [[ -n $once ]] && exit 0
+  sleep "$POLL_SECONDS"
+done
