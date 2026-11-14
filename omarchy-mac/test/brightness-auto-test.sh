@@ -41,8 +41,6 @@ kb() { cat "$t/leds/kbd_backlight/brightness"; }
   fail "shipped table"
 # 150 lux is macOS's 223.1 nits, reached in 20 steps (the 1.94 s ramp).
 run 150; [[ $(b) == 223 ]] || fail "150 lux -> 223 nits: $(b)"
-# The keyboard: 150 lux sits on macOS's flat 70-160 lux part, 0.6916 of 255 = 176.
-[[ $(kb) == 176 ]] || fail "keyboard at 150 lux -> 176: $(kb)"
 [[ $(wc -l <"$t/writes") == 20 ]] || fail "ramp steps: $(wc -l <"$t/writes")"
 # A dark room: macOS's 139.44 nits.
 run 0; [[ $(b) == 139 ]] || fail "0 lux -> 139 nits: $(b)"
@@ -52,13 +50,8 @@ run 75; [[ $(b) == 181 ]] || fail "75 lux -> 181 nits: $(b)"
 : >"$t/writes"; run 77; [[ ! -s $t/writes ]] || fail "jitter moved the panel: $(b)"
 # Bright light: the line carried on to the panel's 600 nits, and held there.
 run 1000; [[ $(b) == 600 ]] || fail "1000 lux -> 600 nits: $(b)"
-# macOS nearly turns the keyboard off in bright light (0.0032 of 255, under 1), never to 0.
-[[ $(kb) == 1 ]] || fail "keyboard at 1000 lux -> 1: $(kb)"
-# Between points: 230 lux -> 0.6916 + (0.0032 - 0.6916) * 70 / 140 = 0.3474 -> 89.
-run 230; [[ $(kb) == 89 ]] || fail "keyboard at 230 lux -> 89: $(kb)"
 # Covered sensor and back: down to the dark level, then back up.
 run 0; [[ $(b) == 139 ]] || fail "covered: $(b)"
-[[ $(kb) == 62 ]] || fail "keyboard in the dark -> 0.2448 of 255 = 62: $(kb)"
 run 75; [[ $(b) == 181 ]] || fail "uncovered: $(b)"
 # The user sets 362 nits at 75 lux (twice the curve): the curve doubles for every room.
 echo 362 >"$t/bl/apple-panel-bl/brightness"; run 75
@@ -70,17 +63,8 @@ run 150 off >/dev/null; run 0; [[ $(b) == 446 ]] || fail "off stays off: $(b)"
 run 0 on >/dev/null; run 0; [[ $(b) == 139 ]] || fail "on resumes: $(b)"
 # Omarchy's own automatic brightness running: step aside.
 touch "$t/stock"; run 150; [[ $(b) == 139 ]] || fail "stock service wins: $(b)"; rm "$t/stock"
-# The keyboard set by hand to 31 in the dark (half the curve): it halves for every room.
-echo 31 >"$t/leds/kbd_backlight/brightness"; run 0
-[[ $(cat "$t/config/omarchy-mac/brightness-auto-kbd-scale") == 0.4966 ]] || fail "kbd scale: $(cat "$t/config/omarchy-mac/brightness-auto-kbd-scale")"
-run 75; [[ $(kb) == 88 ]] || fail "scaled keyboard at 75 lux -> 88: $(kb)"
-rm "$t/config/omarchy-mac/brightness-auto-kbd-scale"
-# A keyboard light turned off (by hand or idle) stays off.
-echo 0 >"$t/leds/kbd_backlight/brightness"; run 1000; run 0; [[ $(kb) == 0 ]] || fail "keyboard off stays off: $(kb)"
-echo 100 >"$t/leds/kbd_backlight/brightness"; rm -f "$t/run/omarchy-mac-brightness-auto.kbd"
-# A panel that is off (0) is not woken, nor is the keyboard moved.
+# A panel that is off (0) is not woken.
 echo 0 >"$t/bl/apple-panel-bl/brightness"; run 150; [[ $(b) == 0 ]] || fail "panel off: $(b)"
-[[ $(kb) == 100 ]] || fail "keyboard moved with the panel off: $(kb)"
 # A Mac without a table, or without a sensor: nothing happens.
 echo 100 >"$t/bl/apple-panel-bl/brightness"; rm -f "$t/run/"*
 printf 'apple,j313\0' >"$t/compatible"; run 150; [[ $(b) == 100 ]] || fail "no table: $(b)"

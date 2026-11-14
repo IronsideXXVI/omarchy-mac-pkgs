@@ -9,8 +9,6 @@
 # curve, in /usr/share/omarchy-mac/brightness named after the device tree's first compatible)
 # and moves the backlight there over the ramp macOS uses. A brightness the user sets by hand
 # becomes the new level for the room: the curve is scaled by it, as macOS scales its curve.
-# With KBD_LED and KBD_CURVE in the table the keyboard backlight follows the room the same way
-# (macOS's keyboard curve); a keyboard light that is off (by hand, idle or a dark panel) stays off.
 # Runs only on a Mac with a table and a light sensor, and steps aside while Omarchy's own
 # omarchy-brightness-auto service runs.
 
@@ -21,14 +19,11 @@ omarchy-hw-apple-silicon 2>/dev/null || exit 0
 table_dir=${OMARCHY_MAC_BRIGHTNESS_DIR:-/usr/share/omarchy-mac/brightness}
 iio_root=${OMARCHY_MAC_IIO_ROOT:-/sys/bus/iio/devices}
 backlight_root=${OMARCHY_MAC_BACKLIGHT_ROOT:-/sys/class/backlight}
-leds_root=${OMARCHY_MAC_LEDS_ROOT:-/sys/class/leds}
 compatible_file=${OMARCHY_MAC_DT_COMPATIBLE:-/proc/device-tree/compatible}
 config_dir=${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-mac
 off_file=$config_dir/brightness-auto-off
 scale_file=$config_dir/brightness-auto-scale
 state_file=${XDG_RUNTIME_DIR:-/tmp}/omarchy-mac-brightness-auto.last
-kbd_state=${XDG_RUNTIME_DIR:-/tmp}/omarchy-mac-brightness-auto.kbd
-kbd_scale_file=$config_dir/brightness-auto-kbd-scale
 once=${OMARCHY_MAC_BRIGHTNESS_ONCE:-}
 step_sleep=${OMARCHY_MAC_BRIGHTNESS_STEP_SLEEP:-}
 
@@ -85,31 +80,6 @@ curve_at() {
   }'
 }
 
-# The keyboard backlight for a room at $1 lux: the curve's share of the LED's maximum, times the user's scale.
-kbd_auto() {
-  local dir=$leds_root/${KBD_LED:-} cur kmax last scale frac want
-  [[ -n ${KBD_LED:-} && -n ${KBD_CURVE:-} && -r $dir/brightness && -r $dir/max_brightness ]] || return 0
-  cur=$(<"$dir/brightness"); kmax=$(<"$dir/max_brightness")
-  (( cur > 0 && kmax > 0 )) || return 0
-  frac=$(curve_at "$1" "$KBD_CURVE")
-  last=$(cat "$kbd_state" 2>/dev/null || echo "")
-  scale=$(cat "$kbd_scale_file" 2>/dev/null || echo 1)
-  if [[ -n $last ]] && (( cur > last + 1 || cur < last - 1 )); then
-    scale=$(awk -v c="$cur" -v m="$kmax" -v f="$frac" 'BEGIN {
-      if (f < 0.001) f = 0.001; s = (c / m) / f; if (s < 0.1) s = 0.1; if (s > 10) s = 10; printf "%.4f\n", s }')
-    mkdir -p "$config_dir" && echo "$scale" >"$kbd_scale_file"
-    echo "$cur" >"$kbd_state"
-    return 0
-  fi
-  want=$(awk -v f="$frac" -v s="$scale" -v m="$kmax" 'BEGIN { w = int(f * s * m + 0.5); if (w < 1) w = 1; if (w > m) w = m; print w }')
-  if awk -v w="$want" -v c="$cur" -v p="$HYSTERESIS_PERCENT" 'BEGIN {
-       d = w - c; if (d < 0) d = -d; l = c * p / 100; if (l < 2) l = 2; exit !(d > l) }'; then
-    brightnessctl -q -d "$KBD_LED" set "$want" >/dev/null 2>&1 && echo "$want" >"$kbd_state"
-  elif [[ -z $last ]]; then
-    echo "$cur" >"$kbd_state"
-  fi
-}
-
 nits_to_raw() { awk -v n="$1" -v m="$2" -v hi="$MAX_NITS" 'BEGIN { r = int(n * m / hi + 0.5); if (r < 1) r = 1; if (r > m) r = m; print r }'; }
 
 status() {
@@ -160,7 +130,6 @@ while :; do
           echo "$raw" >"$state_file"
         fi
       fi
-      kbd_auto "$smoothed"
     fi
   fi
   [[ -n $once ]] && exit 0
